@@ -1,0 +1,6 @@
+groups:
+  - name: combined_metrics
+    interval: 1s
+    rules:
+      - record: combined_memory_usage_bytes
+        expr: sum(container_memory_usage_bytes{id='/system.slice/docker.service'}) + sum(container_memory_usage_bytes{name='benchmarked-container'})

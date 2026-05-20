@@ -1,0 +1,17 @@
+{
+    "core": {
+      "events": [
+        "cpu-cycles",
+        "instructions",
+        "cache-misses",
+        "cache-references",
+        "bus-cycles",
+        "page-faults",
+        "branch-instructions",
+        "branch-misses",
+        "major-faults",
+        "minor-faults"
+      ]
+    }
+  }
+  
