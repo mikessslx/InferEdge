@@ -52,8 +52,11 @@ function run_data_collection() {
                 if [ "$allow_missing_metrics" = 1 ]; then
                     options="$options --allow_missing_metrics"
                 fi
+                if [ "$time_only" = 1 ]; then
+                    options="$options --skip-perf"
+                fi
 
-                python collect_data.py --model "$basename_model" --input "$basename_input" \
+                "$SUITE_PATH/myenv/bin/python" collect_data.py --model "$basename_model" --input "$basename_input" \
                     --trials $trials --set_name $set_name --mechanisms "$mechanisms" \
                     --arch $arch $options
             fi
@@ -61,14 +64,18 @@ function run_data_collection() {
     done
 }
 
-# Check for optional arguments: -a for allowing missing perf events and -m for Mac
-while getopts "am" opt; do
+# Check for optional arguments: -a for allowing missing perf events, -m for Mac,
+# and -t for timing-only collection on targets without compatible cgroup/perf support.
+while getopts "amt" opt; do
     case $opt in
         a)
             allow_missing_metrics=1
             ;;
         m)
             is_mac=1
+            ;;
+        t)
+            time_only=1
             ;;
         \?)
             echo "Invalid option: -$OPTARG" >&2

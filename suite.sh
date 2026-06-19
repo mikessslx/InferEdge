@@ -7,6 +7,8 @@ export PYTHON_VERSION="cp39"
 export PYTORCH_ABI="libtorch-cxx11-abi"
 export PROMETHEUS_VERSION="3.2.1"
 export SUITE_NAME="CS4099Suite"
+export WASMEDGE_REF="${WASMEDGE_REF:-0.14.1}"
+export WASMEDGE_BUILD_MAX_ATTEMPTS="${WASMEDGE_BUILD_MAX_ATTEMPTS:-1}"
 
 function main() {
     prompt_user_for_action
@@ -379,41 +381,64 @@ function generate_mobilenet_model() {
 function build_wasmedge() {
     # Build WasmEdge with the PyTorch plugin
 
-    echo "Building WasmEdge..."
+    echo "Building WasmEdge ref $WASMEDGE_REF..."
+
+    local build_dir="wasmedge"
+
+    # Remove stale source and install output before switching WasmEdge refs.
+    sudo rm -rf WasmEdge "$build_dir"/bin "$build_dir"/include "$build_dir"/lib64 "$build_dir"/plugin
+    mkdir -p "$build_dir"
 
     # Get the WasmEdge source code
     git clone https://github.com/WasmEdge/WasmEdge.git
     cd WasmEdge
-    git checkout 61db304fc4041dfae7cc736858a999a221260933
+    git checkout "$WASMEDGE_REF"
     cd -
 
     # Give the script to run inside the container the necessary permissions
     chmod +x build_scripts/wasmedge/inside_docker_"$arch".sh
 
     local platform="linux/$arch"
-    local build_dir="wasmedge"
-    mkdir -p "$build_dir"
 
-    # The build will randomly fail sometimes so we retry until it succeeds
+    # The build can fail transiently, but deterministic compiler errors should
+    # stop instead of retrying forever.
     docker pull --platform "$platform" "$wasmedge_image"
-    until sudo docker run --platform "$platform" --rm \
-        --entrypoint /bin/bash \
-        -v "$(pwd)/$build_dir":/root/wasmedge-install \
-        -v "$(pwd)/WasmEdge":/root/wasmedge \
-        -v "$(pwd)/libtorch":/root/libtorch \
-        -v "$(pwd)/build_scripts/wasmedge/inside_docker_${arch}.sh":/root/inside_docker.sh \
-        "$wasmedge_image" -c "git config --global --add safe.directory /root/wasmedge && /root/inside_docker.sh"
-    do
-        echo "WasmEdge build failed. Retrying..."
+    local build_attempt=1
+    while true; do
+        if sudo docker run --platform "$platform" --rm \
+            --entrypoint /bin/bash \
+            -v "$(pwd)/$build_dir":/root/wasmedge-install \
+            -v "$(pwd)/WasmEdge":/root/wasmedge \
+            -v "$(pwd)/libtorch":/root/libtorch \
+            -v "$(pwd)/build_scripts/wasmedge/inside_docker_${arch}.sh":/root/inside_docker.sh \
+            "$wasmedge_image" -c "git config --global --add safe.directory /root/wasmedge && /root/inside_docker.sh"
+        then
+            break
+        fi
+
+        if [ "$build_attempt" -ge "$WASMEDGE_BUILD_MAX_ATTEMPTS" ]; then
+            echo "WasmEdge build failed after $build_attempt attempt(s)."
+            exit 1
+        fi
+
+        build_attempt=$((build_attempt + 1))
+        echo "WasmEdge build failed. Retrying attempt $build_attempt/$WASMEDGE_BUILD_MAX_ATTEMPTS..."
     done
 
-    # The build by default stores the libwasmedgePluginWasiNN.so in the wrong directory
-    # for some reason, so we move it here
+    # Keep the WASI-NN plugin in the location expected by target setup.
     mkdir -p "$build_dir"/plugin
 
-    # This file was technically created by another user when the Docker container was run
-    # so we need to use sudo to move it
-    sudo mv "$build_dir"/lib64/wasmedge/libwasmedgePluginWasiNN.so "$build_dir"/plugin
+    # This file may be created by another user when the Docker container is run,
+    # so use sudo when moving it.
+    local wasi_nn_plugin
+    wasi_nn_plugin="$(find "$build_dir" -name libwasmedgePluginWasiNN.so -print -quit)"
+    if [ -z "$wasi_nn_plugin" ]; then
+        echo "Failed to find libwasmedgePluginWasiNN.so after WasmEdge build."
+        exit 1
+    fi
+    if [ "$wasi_nn_plugin" != "$build_dir/plugin/libwasmedgePluginWasiNN.so" ]; then
+        sudo mv -f "$wasi_nn_plugin" "$build_dir"/plugin/
+    fi
 
     # Clean up; again, we need to use sudo because some of the files inside this directory
     # were technically created by another user when the Docker container was run
@@ -469,17 +494,53 @@ function build_cadvisor() {
     mkdir -p "$build_dir"
 
     # Build the container that will build cAdvisor
-    docker buildx build --no-cache --platform linux/"$arch" -t "$image_name" -f Dockerfiles/cadvisor_build/Dockerfile --output type=docker .
+    if ! docker_build_image "$image_name" Dockerfiles/cadvisor_build/Dockerfile; then
+        echo "Failed to build cAdvisor image."
+        exit 1
+    fi
 
     # Create a temporary container so we can extract the 
     # build results
-    local container_id=$(docker create "$image_name")
-    docker cp "$container_id":/output/. "$build_dir"
+    local container_id
+    if ! container_id=$(docker create "$image_name"); then
+        echo "Failed to create cAdvisor build container."
+        exit 1
+    fi
+    if ! docker cp "$container_id":/output/. "$build_dir"; then
+        docker rm "$container_id" >/dev/null 2>&1 || true
+        echo "Failed to copy cAdvisor binary from build container."
+        exit 1
+    fi
 
     # Clean up the container
     docker rm "$container_id"
 
     echo "Finished building cAdvisor!"
+}
+
+function docker_build_image() {
+    local image_name="$1"
+    local dockerfile="$2"
+    local cache_mode="${3:-cache}"
+
+    local build_args=(
+        --platform "linux/$arch"
+        --build-arg "TARGETARCH=$arch"
+        --build-arg "BUILDPLATFORM=linux/$arch"
+        -t "$image_name"
+        -f "$dockerfile"
+    )
+
+    if [ "$cache_mode" = "no-cache" ]; then
+        build_args=(--no-cache "${build_args[@]}")
+    fi
+
+    if docker buildx version >/dev/null 2>&1; then
+        docker buildx build "${build_args[@]}" --load .
+    else
+        echo "docker buildx is not available; falling back to docker build."
+        docker build "${build_args[@]}" .
+    fi
 }
 
 function download_prometheus() {
@@ -507,17 +568,31 @@ function build_docker_and_native() {
     echo "Building the Docker image and native binary..."
     local image_name="image-classification:$arch"
 
-    # Build the Docker container 
-    docker buildx build --platform linux/"$arch" -t "$image_name" -f Dockerfiles/image_classification/Dockerfile --output type=docker .
+    # Build the Docker container
+    if ! docker_build_image "$image_name" Dockerfiles/image_classification/Dockerfile; then
+        echo "Failed to build Docker image and native binary."
+        exit 1
+    fi
 
     # Save the Docker container into a tar file
-    docker save -o docker/image-classification-${arch}.tar "$image_name"
+    if ! docker save -o docker/image-classification-${arch}.tar "$image_name"; then
+        echo "Failed to save Docker image."
+        exit 1
+    fi
 
     # Extract the binary compiled for the container so it can also be run for the 
     # native deployment mechanism
     mkdir -p native
-    local container_id=$(docker create "$image_name")
-    docker cp "$container_id":/torch_image_classification native
+    local container_id
+    if ! container_id=$(docker create "$image_name"); then
+        echo "Failed to create native extraction container."
+        exit 1
+    fi
+    if ! docker cp "$container_id":/torch_image_classification native; then
+        docker rm "$container_id" >/dev/null 2>&1 || true
+        echo "Failed to copy native binary from image."
+        exit 1
+    fi
 
     # Clean up the container
     docker rm "$container_id"
@@ -536,10 +611,16 @@ function compile_wasm() {
 
     # Move the compiled Wasm binary to the wasm directory
     mkdir -p wasm
-    mv rust/wasm/target/wasm32-wasip1/release/interpreted.wasm wasm
+    local wasm_src="rust/wasm/target/wasm32-wasip1/release/interpreted.wasm"
+    local wasm_dst="wasm/interpreted.wasm"
+    if [ -e "$wasm_dst" ] && [ "$wasm_src" -ef "$wasm_dst" ]; then
+        echo "WebAssembly binary already exists at $wasm_dst."
+    else
+        mv -f "$wasm_src" "$wasm_dst"
+    fi
 
     echo "Finished compiling the WebAssembly binary!"
-}   
+}
 
 function transfer_files() {
     # Transfer the files required to run the experiments to the target machine
@@ -840,7 +921,8 @@ function prompt_user_for_mechanisms() {
         echo "1. Native"
         echo "2. Docker"
         echo "3. WebAssembly interpreted"
-        echo "4. WebAssembly ahead of time (AoT)-compiled"
+        echo "4. WebAssembly JIT-compiled"
+        echo "5. WebAssembly ahead of time (AoT)-compiled"
     local mechanisms_input
     read -p "Enter the numbers identifying the deployment mechanisms you would like to include (comma-separated): " mechanisms_input
 
@@ -853,7 +935,8 @@ function prompt_user_for_mechanisms() {
             1) mechanisms+=("native") ;;
             2) mechanisms+=("docker") ;;
             3) mechanisms+=("wasm_interpreted") ;;
-            4) mechanisms+=("wasm_aot") ;;
+            4) mechanisms+=("wasm_jit") ;;
+            5) mechanisms+=("wasm_aot") ;;
         esac
     done
 

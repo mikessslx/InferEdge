@@ -140,12 +140,12 @@ function setup_collect_data() {
 
 function aot_compile_wasm_non_mac() {
     # AoT compile the WebAssembly code (if not on Mac)
-    wasmedge compile "$SUITE_PATH/wasm/interpreted.wasm" "$SUITE_PATH/wasm/aot.wasm"
+    wasmedge compile --optimize 0 "$SUITE_PATH/wasm/interpreted.wasm" "$SUITE_PATH/wasm/aot.wasm"
 }
 
 function aot_compile_wasm_mac() {
     # AoT compile the WebAssembly code (if on Mac)
-    wasmedge compile "$SUITE_PATH/wasm/interpreted.wasm" "$SUITE_PATH/wasm/aot.so"
+    wasmedge compile --optimize 0 "$SUITE_PATH/wasm/interpreted.wasm" "$SUITE_PATH/wasm/aot.so"
 }
 
 # Check if user passed in an optional argument specifying the target machine

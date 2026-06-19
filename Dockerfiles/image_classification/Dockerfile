@@ -1,4 +1,5 @@
 # Build stage: compile Rust app
+ARG BUILDPLATFORM=linux/amd64
 FROM --platform=$BUILDPLATFORM rust:1.82-bullseye AS build
 
 ARG TARGETARCH

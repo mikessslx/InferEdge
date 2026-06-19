@@ -280,12 +280,17 @@ def parse_csv_rows(results_filename, deployment_mechanisms, metrics, docker_over
                 df["instructions-per-cycle"] = df["instructions"] / df["cpu-cycles"]
                 df["cycles-per-instruction"] = df["cpu-cycles"] / df["instructions"]
         else:
+            model_loaded_col = "until-model-loaded-time-(seconds)" if "until-model-loaded-time-(seconds)" in df.columns else "until-model-loaded-time-seconds"
+            input_loaded_col = "until-input-loaded-time-(seconds)" if "until-input-loaded-time-(seconds)" in df.columns else "until-input-loaded-time-seconds"
+            input_resized_col = "until-input-resized-time-(seconds)" if "until-input-resized-time-(seconds)" in df.columns else "until-input-resized-time-seconds"
+            input_ready_col = "until-input-ready-time-(seconds)" if "until-input-ready-time-(seconds)" in df.columns else "until-input-ready-time-seconds"
+            inference_executed_col = "until-inference-executed-time-(seconds)" if "until-inference-executed-time-(seconds)" in df.columns else "until-inference-executed-time-seconds"
             df["overhead-time-seconds"] = df["wall-time-seconds"] - df["workload-time-seconds"]
-            df["model-load-time-(seconds)"] = df["until-model-loaded-time-(seconds)"]
-            df["input-preparation-time-(seconds)"] = df["until-input-ready-time-(seconds)"] - df["until-model-loaded-time-(seconds)"]
-            df["inference-time-(seconds)"] = df["until-inference-executed-time-(seconds)"] - df["until-input-ready-time-(seconds)"]
-            df["input-resize-time-(seconds)"] = df["until-input-resized-time-(seconds)"] - df["until-input-loaded-time-(seconds)"]
-            df["input-load-time-(seconds)"] = df["until-input-loaded-time-(seconds)"] - df["until-model-loaded-time-(seconds)"]
+            df["model-load-time-(seconds)"] = df[model_loaded_col]
+            df["input-preparation-time-(seconds)"] = df[input_ready_col] - df[model_loaded_col]
+            df["inference-time-(seconds)"] = df[inference_executed_col] - df[input_ready_col]
+            df["input-resize-time-(seconds)"] = df[input_resized_col] - df[input_loaded_col]
+            df["input-load-time-(seconds)"] = df[input_loaded_col] - df[model_loaded_col]
 
         # Drop rows corresponding to deployment mechanisms that were not specified
         df = df.drop(df[~df["deployment-mechanism"].isin(deployment_mechanisms)].index)
@@ -380,8 +385,8 @@ def main():
     parser.add_argument("--significance-level", type=float, default=0.05, help="The significance level to use (e.g., 0.05).")
     parser.add_argument("--docker-overhead-view", type=int, default=2, help="The view of the Docker overhead to use (0: exclude daemon overhead, 1: include full daemon overhead, 2: include only additional docker overhead).")
     parser.add_argument("--include-insignificant-output", action="store_true", help="Include statistical comparisons when they are not statistically significant.")
-    parser.add_argument("--mechanisms", type=str, default="docker,wasm_interpreted,wasm_aot,native",
-                    help="Comma-separated list of mechanisms to include (choose from docker, wasm_interpreted, wasm_aot, native)")
+    parser.add_argument("--mechanisms", type=str, default="docker,wasm_interpreted,wasm_jit,wasm_aot,native",
+                    help="Comma-separated list of mechanisms to include (choose from docker, wasm_interpreted, wasm_jit, wasm_aot, native)")
     parser.add_argument("--metrics", type=str, required=True, help="Comma-separated list of metrics to include.")
     parser.add_argument("--view-output", action="store_true", help="View the output of the analysis.")
     parser.add_argument("--save-output", action="store_true", 

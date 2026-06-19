@@ -17,3 +17,14 @@ docker/*.tar
 native/torch_image_classification
 ubuntu_files
 results/*
+
+# Python
+__pycache__/
+*.py[cod]
+
+# LibTorch
+libtorch/build-hash
+libtorch/build-version
+
+# Reports
+reports/
