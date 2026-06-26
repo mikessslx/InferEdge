@@ -170,6 +170,10 @@ MAX_RETRIES = 15
 # Variable tracking whether cAdvisor and Prometheus are currently running or not
 cadvisor_and_prometheus_running = False
 
+# When perf collection is enabled, the persistent JIT run can also provide the
+# timing rows. Cache them so the time collection step does not start JIT again.
+persistent_jit_time_rows_by_file = {}
+
 def is_cgroup_v2():
     """Checks if the system is using cgroup v2
     
@@ -205,6 +209,8 @@ def collect_time_data(n, results_filename, container_exec_cmd, container_start_c
         experiments += ["wasm_aot"] * n
     if "native" in deployment_mechanisms:
         experiments += ["native"] * n
+    if "wasm_jit" in deployment_mechanisms and results_filename not in persistent_jit_time_rows_by_file:
+        experiments += ["wasm_jit"]
     random.shuffle(experiments)
 
     # Keep track of trial number for each deployment mechanism
@@ -215,6 +221,8 @@ def collect_time_data(n, results_filename, container_exec_cmd, container_start_c
     native_trial = 1
 
     metrics = []
+    if "wasm_jit" in deployment_mechanisms and results_filename in persistent_jit_time_rows_by_file:
+        metrics.extend(persistent_jit_time_rows_by_file.pop(results_filename))
 
     # Noting that experiments contains deployment mechanisms in the order they will be run
     for deployment_mechanism in experiments:
@@ -253,17 +261,14 @@ def collect_time_data(n, results_filename, container_exec_cmd, container_start_c
                     if attempt == MAX_RETRIES - 1:
                         break
         elif deployment_mechanism == "wasm_jit":
-            trial = wasm_jit_trial
-            print(f"Trial {trial}")
-            wasm_jit_trial += 1
+            print(f"Running {n} JIT trials in one persistent WasmEdge process")
             for attempt in range(MAX_RETRIES):
                 try:
-                    trial_metrics = run_time_experiment(wasm_jit_cmd)
-                    trial_metrics_rows = prepare_trial_data_as_csv_rows(deployment_mechanism, trial, start_time, trial_metrics, TIME_METRICS_SHORT_NAMES)
-                    metrics.extend(trial_metrics_rows)
+                    persistent_trial_metrics = run_persistent_time_experiment(wasm_jit_cmd, n)
+                    metrics.extend(prepare_persistent_time_rows(deployment_mechanism, start_time, persistent_trial_metrics))
                     break
                 except Exception as e:
-                    print(f"Error during wasm_jit trial {trial}, attempt {attempt + 1}: {e}")
+                    print(f"Error during persistent wasm_jit run, attempt {attempt + 1}: {e}")
                     if attempt == MAX_RETRIES - 1:
                         break
         elif deployment_mechanism == "wasm_aot":
@@ -376,6 +381,105 @@ def run_time_experiment(cmd):
 
     return [("", time_metrics)]
 
+def run_persistent_time_experiment(cmd, trials):
+    """Run one persistent JIT process and split its output into per-trial timing rows."""
+    stop_cadvisor_and_prometheus_if_running()
+    cmd = TIME_CMD_PREFIX.split() + cmd.split()
+    cmd_output, time_output = run_shell_cmd_and_get_stdout_and_stderr(cmd)
+    process_time_metrics = parse_time_output(time_output)
+    return build_persistent_time_metrics(cmd_output, process_time_metrics["wall-time-seconds"], trials)
+
+def prepare_persistent_time_rows(deployment_mechanism, start_time, persistent_trial_metrics):
+    """Convert persistent-process timing dictionaries into the suite's CSV rows."""
+    rows = []
+    for trial, trial_metrics in enumerate(persistent_trial_metrics, start=1):
+        rows.extend(prepare_trial_data_as_csv_rows(
+            deployment_mechanism,
+            trial,
+            start_time,
+            [("", trial_metrics)],
+            TIME_METRICS_SHORT_NAMES,
+        ))
+    return rows
+
+def build_persistent_time_metrics(output, process_wall_seconds, expected_trials):
+    """Build per-trial timing metrics from one persistent workload process.
+
+    Trial 1 receives the process-level cold-start overhead. Later trials keep only
+    the in-process repeated inference/request time, because the WasmEdge/JIT
+    process is already alive.
+    """
+    trial_metrics = parse_persistent_time_output(output)
+    if len(trial_metrics) != expected_trials:
+        raise ValueError(f"Expected {expected_trials} persistent JIT trials, found {len(trial_metrics)}")
+
+    warm_workload_seconds = sum(metrics["workload-time-seconds"] for metrics in trial_metrics[1:])
+    for index, metrics in enumerate(trial_metrics):
+        workload_seconds = metrics["workload-time-seconds"]
+        if index == 0:
+            wall_time_seconds = max(workload_seconds, process_wall_seconds - warm_workload_seconds)
+        else:
+            wall_time_seconds = workload_seconds
+
+        metrics["wall-time-seconds"] = round(wall_time_seconds, 6)
+        metrics["overhead-time-seconds"] = round(max(0, wall_time_seconds - workload_seconds), 6)
+
+    return trial_metrics
+
+def parse_persistent_time_output(output):
+    """Parse timing metrics emitted between InferEdge trial start/end markers."""
+    trials = []
+    current_trial_metrics = None
+
+    for line in output.split("\n"):
+        line = line.strip()
+        if line.startswith("InferEdge trial ") and line.endswith(" start"):
+            current_trial_metrics = {}
+            continue
+        if line.startswith("InferEdge trial ") and line.endswith(" end"):
+            if current_trial_metrics is None:
+                raise ValueError("Found persistent trial end marker without a start marker")
+            trials.append(current_trial_metrics)
+            current_trial_metrics = None
+            continue
+        if current_trial_metrics is None:
+            continue
+
+        metric = parse_time_metric_line(line)
+        if metric is not None:
+            metric_name, value = metric
+            current_trial_metrics[metric_name] = value
+
+    if current_trial_metrics is not None:
+        raise ValueError("Found persistent trial start marker without an end marker")
+
+    return trials
+
+def parse_time_metric_line(line):
+    """Parse one timing metric line, returning (metric_name, value) or None."""
+    for metric_actual_name, metric_new_name in TIME_METRICS:
+        if metric_actual_name in line:
+            words = line.strip().split()
+            raw_value = words[-1]
+
+            if metric_new_name == "wall-time-seconds":
+                time_parts = raw_value.split(":")
+                float_time_parts = [float(time_part) for time_part in time_parts]
+                if len(time_parts) == 2: # m:ss format
+                    mins, seconds = float_time_parts
+                    value = mins * 60 + seconds
+                elif len(time_parts) == 3: # h:mm:ss format
+                    hours, mins, seconds = float_time_parts
+                    value = hours * 3600 + mins * 60 + seconds
+                else:
+                    value = float(raw_value)
+            else:
+                value = float(raw_value)
+
+            return metric_new_name, value
+
+    return None
+
 def parse_time_output(output):
     """Parses an output of the time experiments and collects the time metrics from it.
 
@@ -387,32 +491,14 @@ def parse_time_output(output):
     """
     metrics = {}
     for line in output.split("\n"):
-        for metric in TIME_METRICS:
-            metric_actual_name = metric[0]
-            metric_new_name = metric[1]
-
-            if metric_actual_name in line:
-                words = line.strip().split()
-                raw_value = words[-1]
-                
-                if metric_new_name == "wall-time-seconds":
-                    time_parts = raw_value.split(":")
-                    float_time_parts = [float(time_part) for time_part in time_parts]
-                    if len(time_parts) == 2: # m:ss format
-                        mins, seconds = float_time_parts
-                        value = mins * 60 + seconds
-                    elif len(time_parts) == 3: # h:mm:ss format
-                        hours, mins, seconds = float_time_parts
-                        value = hours * 3600 + mins * 60 + seconds
-                # Output will already be in e.g. format 4.02 for 4.02 seconds, no further processing needed
-                else:
-                    value = float(raw_value)
-
-                metrics[metric_new_name] = value
+        metric = parse_time_metric_line(line)
+        if metric is not None:
+            metric_name, value = metric
+            metrics[metric_name] = value
 
     return metrics
 
-def collect_perf_data(n, results_filename, container_exec_cmd, container_start_cmd, wasm_interpreted_cmd, wasm_jit_cmd, wasm_aot_cmd, native_cmd, 
+def collect_perf_data(n, results_filename, container_exec_cmd, container_start_cmd, wasm_interpreted_cmd, wasm_jit_cmd, wasm_aot_cmd, native_cmd,
     allow_missing_metrics, deployment_mechanisms):
     """Runs the performance experiments (measuring performance metrics besides time) and collects the relevant data from Prometheus, 
     storing it in the specified file.
@@ -437,7 +523,7 @@ def collect_perf_data(n, results_filename, container_exec_cmd, container_start_c
     if "wasm_interpreted" in deployment_mechanisms:
         experiments += ["wasm_interpreted"] * n
     if "wasm_jit" in deployment_mechanisms:
-        experiments += ["wasm_jit"] * n
+        experiments += ["wasm_jit"]
     if "wasm_aot" in deployment_mechanisms:
         experiments += ["wasm_aot"] * n
     if "native" in deployment_mechanisms:
@@ -496,18 +582,24 @@ def collect_perf_data(n, results_filename, container_exec_cmd, container_start_c
                     if attempt == MAX_RETRIES - 1:
                         raise
         elif experiment == "wasm_jit":
-            trial = wasm_jit_trial
-            print(f"Trial {trial}")
-            wasm_jit_trial += 1
+            print(f"Running {n} JIT trials in one persistent WasmEdge process")
             for attempt in range(MAX_RETRIES):
                 try:
-                    trial_metrics = run_non_container_perf_experiment(wasm_jit_cmd)
-                    trial_metrics_row = prepare_trial_data_as_csv_rows(experiment, trial, start_time, trial_metrics, 
-                        PERF_EVENTS + MEMORY_FIELD_NAMES + CPU_FIELD_NAMES, allow_missing_metrics)
-                    metrics.extend(trial_metrics_row)
+                    trial_metrics, cmd_output, process_wall_seconds = run_persistent_non_container_perf_experiment(wasm_jit_cmd)
+                    normalized_trial_metrics = normalize_persistent_perf_metrics(trial_metrics, n)
+                    for trial in range(1, n + 1):
+                        trial_metrics_row = prepare_trial_data_as_csv_rows(experiment, trial, start_time, normalized_trial_metrics,
+                            PERF_EVENTS + MEMORY_FIELD_NAMES + CPU_FIELD_NAMES, allow_missing_metrics)
+                        metrics.extend(trial_metrics_row)
+                    time_results_filename = results_filename.replace(PERF_RESULTS_FILENAME_SUFFIX, TIME_RESULTS_FILENAME_SUFFIX)
+                    persistent_jit_time_rows_by_file[time_results_filename] = prepare_persistent_time_rows(
+                        experiment,
+                        start_time,
+                        build_persistent_time_metrics(cmd_output, process_wall_seconds, n)
+                    )
                     break
                 except Exception as e:
-                    print(f"Error during wasm_jit trial {trial}, attempt {attempt + 1}: {e}")
+                    print(f"Error during persistent wasm_jit run, attempt {attempt + 1}: {e}")
                     if not is_cgroup_v2():
                         delete_prometheus_series_given_id(CUSTOM_CGROUP_NAME)
                     if attempt == MAX_RETRIES - 1:
@@ -758,6 +850,96 @@ def run_non_container_perf_experiment_cgroup_v2(cmd):
 
     return [("", metrics)]
 
+def run_command_in_cgroup_v2_with_output(cmd, cgroup_path):
+    """Run a command inside a cgroup v2 group and return metrics plus stdout."""
+    before = read_cgroup_v2_snapshot(cgroup_path)
+    quoted_cmd = " ".join(shlex.quote(part) for part in shlex.split(cmd))
+    shell_cmd = (
+        f"echo $$ > {shlex.quote(os.path.join(cgroup_path, 'cgroup.procs'))}; "
+        f"export LD_LIBRARY_PATH={shlex.quote(LD_LIBRARY_PATH or '')}; "
+        f"export PATH={shlex.quote(PATH or '')}; "
+        f"exec {quoted_cmd}"
+    )
+
+    start_timestamp = datetime.now(timezone.utc).timestamp()
+    process = subprocess.Popen(["sudo", "sh", "-c", shell_cmd], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    memory_samples = []
+    after = read_cgroup_v2_snapshot(cgroup_path)
+    while process.poll() is None:
+        memory_samples.append(read_cgroup_v2_int_file(os.path.join(cgroup_path, "memory.current")))
+        after = read_cgroup_v2_snapshot(cgroup_path)
+        time.sleep(CGROUP_V2_POLL_INTERVAL_SECONDS)
+
+    stdout, stderr = process.communicate()
+    end_timestamp = datetime.now(timezone.utc).timestamp()
+    if process.returncode != 0:
+        print(f"Error executing command: {' '.join(process.args)}")
+        print(f"Return code: {process.returncode}")
+        print(f"Output: {stdout}")
+        print(f"Error: {stderr}")
+        raise subprocess.CalledProcessError(process.returncode, process.args, output=stdout, stderr=stderr)
+
+    if os.path.exists(cgroup_path):
+        after = read_cgroup_v2_snapshot(cgroup_path)
+        memory_samples.append(after["memory_current"])
+
+    duration_seconds = end_timestamp - start_timestamp
+    return build_cgroup_v2_metrics(before, after, memory_samples, duration_seconds), stdout, duration_seconds
+
+def run_persistent_non_container_perf_experiment(cmd):
+    """Run one persistent non-container process and return aggregate perf metrics plus stdout."""
+    if is_cgroup_v2():
+        return run_persistent_non_container_perf_experiment_cgroup_v2(cmd)
+
+    start_cadvisor_and_prometheus_if_not_running()
+
+    run_shell_cmd(CREATE_CGROUP_CMD.split())
+
+    start_time = datetime.now(timezone.utc)
+    start_timestamp = start_time.timestamp()
+
+    run_in_cgroup_cmd = EXEC_IN_CGROUP_CMD_PREFIX.split() + cmd.split()
+    cmd_output = run_shell_cmd_and_get_stdout(run_in_cgroup_cmd)
+
+    end_time = datetime.now(timezone.utc)
+    end_timestamp = end_time.timestamp()
+
+    execution_duration_ms = round((end_timestamp - start_timestamp) * 1000)
+
+    metrics = {}
+
+    for query, label in zip(PROMETHEUS_PERF_AND_MEMORY_QUERIES, PROMETHEUS_QUERIES_LABELS):
+        formatted_query = query.format(name_or_id=f"/{CUSTOM_CGROUP_NAME}",
+            container_duration_ms=execution_duration_ms, end_container_timestamp=end_timestamp)
+        metrics.update(get_parsed_prometheus_query_results(formatted_query, label))
+
+    delete_prometheus_series_given_id(CUSTOM_CGROUP_NAME)
+
+    return [("", metrics)], cmd_output, end_timestamp - start_timestamp
+
+def run_persistent_non_container_perf_experiment_cgroup_v2(cmd):
+    """Run one persistent non-container process using cgroup v2 counters."""
+    prepare_cgroup_v2_custom_cgroup()
+    try:
+        metrics, cmd_output, duration_seconds = run_command_in_cgroup_v2_with_output(cmd, CGROUP_V2_CUSTOM_PATH)
+    finally:
+        cleanup_cgroup_v2_custom_cgroup()
+
+    return [("", metrics)], cmd_output, duration_seconds
+
+def normalize_persistent_perf_metrics(trial_metrics_sets, trials):
+    """Convert one persistent-process perf measurement to average per-trial rows."""
+    normalized_sets = []
+    for identifier, trial_metrics in trial_metrics_sets:
+        normalized_metrics = {}
+        for metric_name, value in trial_metrics.items():
+            if metric_name in PERF_EVENTS:
+                normalized_metrics[metric_name] = round(value / trials, 2)
+            else:
+                normalized_metrics[metric_name] = value
+        normalized_sets.append((identifier, normalized_metrics))
+    return normalized_sets
+
 def docker_create_command(container_exec_cmd, container_start_cmd, gate_dir=None):
     """Build a docker create command corresponding to the suite's docker run command."""
     start_parts = shlex.split(container_start_cmd)
@@ -834,13 +1016,13 @@ def run_container_perf_experiment_cgroup_v2(container_exec_cmd, container_start_
         wait_stdout, wait_stderr = wait_process.communicate()
         container_status = int(wait_stdout.strip() or "0")
         if wait_process.returncode != 0 or container_status != 0:
-            raise subprocess.CalledProcessError(wait_process.returncode, wait_process.args, 
+            raise subprocess.CalledProcessError(wait_process.returncode, wait_process.args,
                 output=wait_stdout, stderr=wait_stderr)
 
         daemon_after = read_cgroup_v2_snapshot(CGROUP_V2_DOCKER_SERVICE_PATH)
         duration_seconds = end_timestamp - start_timestamp
         container_metrics = build_cgroup_v2_metrics(container_before, container_after, memory_samples, duration_seconds)
-        daemon_metrics_during_container = build_cgroup_v2_metrics(daemon_before, daemon_after, 
+        daemon_metrics_during_container = build_cgroup_v2_metrics(daemon_before, daemon_after,
             [daemon_before["memory_current"], daemon_after["memory_current"], daemon_after["memory_peak"]], duration_seconds)
 
         container_and_daemon_metrics = add_metric_dicts(container_metrics, daemon_metrics_during_container)
@@ -1300,7 +1482,7 @@ def main():
 
     # The commands to execute for the WebAssembly deployment mechanisms
     wasm_interpreted_cmd =f"{WASM_BINARY_PATH} --force-interpreter --dir .:. {INTERPRETED_WASM_FILE_PATH} {model_path} {input_path}"
-    wasm_jit_cmd = f"{WASM_BINARY_PATH} --enable-jit --dir .:. {INTERPRETED_WASM_FILE_PATH} {model_path} {input_path}"
+    wasm_jit_cmd = f"{WASM_BINARY_PATH} --enable-jit --dir .:. {INTERPRETED_WASM_FILE_PATH} {model_path} {input_path} --trials {trials}"
     wasm_aot_cmd = f"{WASM_BINARY_PATH} --dir .:. {aot_wasm_file_path} {model_path} {input_path}"
 
     # The command to execute for the native deployment mechanism
