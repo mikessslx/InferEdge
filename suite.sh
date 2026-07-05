@@ -459,7 +459,7 @@ function download_libtorch_arm64() {
     unzip -q torch.whl -d "$temp_dir"
     rm -f torch.whl
 
-    mkdir -p "$build_dir"
+    prepare_libtorch_build_dir "$build_dir"
     mv "$temp_dir"/torch/lib "$temp_dir"/torch/bin "$temp_dir"/torch/include \
         "$temp_dir"/torch/share "$build_dir"
     rm -rf "$temp_dir"
@@ -479,10 +479,19 @@ function download_libtorch_amd64() {
     unzip -q torch.zip -d "$temp_dir"
     rm -f torch.zip
 
-    mkdir -p "$build_dir" 
+    prepare_libtorch_build_dir "$build_dir"
     mv "$temp_dir"/libtorch/* "$build_dir"
+    rm -rf "$temp_dir"
 
     echo "Finished downloading libtorch!"
+}
+
+function prepare_libtorch_build_dir() {
+    local build_dir="$1"
+
+    mkdir -p "$build_dir"
+    rm -rf "$build_dir"/bin "$build_dir"/include "$build_dir"/lib "$build_dir"/share \
+        "$build_dir"/build-hash "$build_dir"/build-version
 }
 
 function build_cadvisor() {
