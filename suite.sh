@@ -29,6 +29,20 @@ function prompt_user_for_target_details() {
     echo
 }
 
+function is_local_target() {
+    # Return success when the configured target is this machine. This lets the
+    # suite run directly on an edge board without ssh-ing back into itself.
+    local host_short
+    local host_full
+    host_short=$(hostname -s 2>/dev/null || hostname)
+    host_full=$(hostname -f 2>/dev/null || hostname)
+
+    case "$target_address" in
+        "127.0.0.1"|"localhost"|"$host_short"|"$host_full") return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 function prompt_user_for_architecture_if_not_set() {
     # Prompt the user for the architecture of the target machine if it is not set
     if [ -z "$arch" ]; then
@@ -406,6 +420,7 @@ function build_wasmedge() {
     local build_attempt=1
     while true; do
         if sudo docker run --platform "$platform" --rm \
+            --network host \
             --entrypoint /bin/bash \
             -v "$(pwd)/$build_dir":/root/wasmedge-install \
             -v "$(pwd)/WasmEdge":/root/wasmedge \
@@ -460,7 +475,7 @@ function download_libtorch_arm64() {
     rm -f torch.whl
 
     prepare_libtorch_build_dir "$build_dir"
-    mv "$temp_dir"/torch/lib "$temp_dir"/torch/bin "$temp_dir"/torch/include \
+    cp -a "$temp_dir"/torch/lib "$temp_dir"/torch/bin "$temp_dir"/torch/include \
         "$temp_dir"/torch/share "$build_dir"
     rm -rf "$temp_dir"
 
@@ -480,7 +495,7 @@ function download_libtorch_amd64() {
     rm -f torch.zip
 
     prepare_libtorch_build_dir "$build_dir"
-    mv "$temp_dir"/libtorch/* "$build_dir"
+    cp -a "$temp_dir"/libtorch/. "$build_dir"
     rm -rf "$temp_dir"
 
     echo "Finished downloading libtorch!"
@@ -534,6 +549,7 @@ function docker_build_image() {
 
     local build_args=(
         --platform "linux/$arch"
+        --network host
         --build-arg "TARGETARCH=$arch"
         --build-arg "BUILDPLATFORM=linux/$arch"
         -t "$image_name"
@@ -768,7 +784,26 @@ function run_data_collection() {
         options="$options -a"
     fi
 
-    sshpass -p "$target_password" ssh -t "$target_username@$target_address" "/home/$target_username/Desktop/$SUITE_NAME/target_scripts/collect_data.sh $options $trials "$set_name" $mechanisms"
+    local suite_path="/home/$target_username/Desktop/$SUITE_NAME"
+    local collect_script="$suite_path/target_scripts/collect_data.sh"
+    if is_local_target; then
+        echo "Target is local; running data collection without SSH."
+        (
+            cd "$suite_path" || exit 1
+            export INFEREDGE_PERF_BIN="${INFEREDGE_PERF_BIN:-}"
+            "$collect_script" $options "$trials" "$set_name" "$mechanisms"
+        )
+    else
+        local remote_cmd
+        printf -v remote_cmd 'export INFEREDGE_PERF_BIN=%q; cd %q && %q %s %q %q %q'             "${INFEREDGE_PERF_BIN:-}" "$suite_path" "$collect_script" "$options" "$trials" "$set_name" "$mechanisms"
+        sshpass -p "$target_password" ssh -t "$target_username@$target_address" "$remote_cmd"
+    fi
+
+    local status=$?
+    if [ "$status" -ne 0 ]; then
+        echo "Data collection failed with exit code $status."
+        return "$status"
+    fi
 
     echo "Finished running data collection on target device!"
 }

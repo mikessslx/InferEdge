@@ -27,6 +27,10 @@ function main() {
     # Create the results directory 
     cd "$SUITE_PATH"
     mkdir -p "results/$set_name"
+    collect_data_script="collect_data.py"
+    if [ ! -f "$collect_data_script" ] && [ -f "data_scripts/collect_data.py" ]; then
+        collect_data_script="data_scripts/collect_data.py"
+    fi
 
     # Activate the Python environment with the necessary dependencies to run the data 
     # collection script
@@ -38,8 +42,17 @@ function main() {
 function run_data_collection() {
     # Iterate over each model file in the models folder and each input file in the inputs folder,
     # and run the collect_data.py script on them with the specified options
-    for model in models/*; do
-        for input in inputs/*; do
+    local models_dir="models"
+    local inputs_dir="inputs"
+    if compgen -G "models/models/*" > /dev/null; then
+        models_dir="models/models"
+    fi
+    if compgen -G "inputs/inputs/*" > /dev/null; then
+        inputs_dir="inputs/inputs"
+    fi
+
+    for model in "$models_dir"/*; do
+        for input in "$inputs_dir"/*; do
             if [ -f "$model" ] && [ -f "$input" ]; then
                 basename_model=$(basename "$model")
                 basename_input=$(basename "$input")
@@ -56,7 +69,7 @@ function run_data_collection() {
                     options="$options --skip-perf"
                 fi
 
-                "$SUITE_PATH/myenv/bin/python" collect_data.py --model "$basename_model" --input "$basename_input" \
+                "$SUITE_PATH/myenv/bin/python" "$collect_data_script" --model "$basename_model" --input "$basename_input" \
                     --trials $trials --set_name $set_name --mechanisms "$mechanisms" \
                     --arch $arch $options
             fi

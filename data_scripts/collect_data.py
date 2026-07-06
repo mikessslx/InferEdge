@@ -10,11 +10,17 @@ import os
 import argparse
 import time
 import shlex
+import shutil
 from datetime import datetime, timezone
 from sys import platform
 
-# The root of the suite directory where this script is in
-SUITE_DIR = os.path.abspath(os.path.dirname(__file__))
+# The root of the suite directory. In transferred target layout this script may
+# live at the suite root; in source checkout layout it lives under data_scripts.
+SCRIPT_DIR = os.path.abspath(os.path.dirname(__file__))
+if os.path.basename(SCRIPT_DIR) == "data_scripts":
+    SUITE_DIR = os.path.dirname(SCRIPT_DIR)
+else:
+    SUITE_DIR = SCRIPT_DIR
 
 # The absolute path of the directory storing results
 RESULTS_DIR = os.path.join(SUITE_DIR, "results")
@@ -54,9 +60,9 @@ CONTAINER_NAME="benchmarked-container"
 IMG_NAME_TEMPLATE="image-classification:{arch}"         
 
 # Commands to start, stop, remove, inspect container
-CONTAINER_START_CMD_TEMPLATE = f"sudo docker run --privileged --name {CONTAINER_NAME} -v {MODELS_PATH}:/models -v {INPUTS_PATH}:/inputs {{img_name}}"
+CONTAINER_START_CMD_TEMPLATE = f"sudo docker run --privileged --network host --name {CONTAINER_NAME} -v {MODELS_PATH}:/models -v {INPUTS_PATH}:/inputs {{img_name}}"
 CONTAINER_STOP_CMD = "sudo docker stop {container_name}"
-CONTAINER_REMOVE_CMD = "sudo docker rm {container_name}"
+CONTAINER_REMOVE_CMD = "sudo docker rm -f {container_name}"
 CONTAINER_INSPECT_ID_CMD = "sudo docker inspect -f '{{{{.Id}}}}' {container_name}"
 
 # Commands to start and stop Prometheus, cAdvisor
@@ -67,10 +73,39 @@ CADVISOR_STOP_CMD = f"sudo pkill -f {CADVISOR_BINARY_PATH}"
 
 # Values for the PATH and LD_LIBRARY_PATH environment variables
 LD_LIBRARY_PATH = os.environ.get("LD_LIBRARY_PATH")
+DEFAULT_LIBRARY_PATHS = [
+    os.path.expanduser("~/.wasmedge/lib64"),
+    os.path.join(SUITE_DIR, "libtorch", "lib"),
+]
+for library_path in DEFAULT_LIBRARY_PATHS:
+    if library_path not in (LD_LIBRARY_PATH or "").split(":"):
+        LD_LIBRARY_PATH = f"{LD_LIBRARY_PATH}:{library_path}" if LD_LIBRARY_PATH else library_path
 PATH = os.environ.get("PATH")
+COMMAND_ENV = os.environ.copy()
+COMMAND_ENV["LD_LIBRARY_PATH"] = LD_LIBRARY_PATH or ""
+COMMAND_ENV["PATH"] = PATH or ""
 
 # The command used to measure wall time
 TIME_CMD_PREFIX="/usr/bin/time -v"
+
+# Hardware perf events measured directly with perf stat on cgroup v2 systems.
+# cAdvisor exposes these on cgroup v1; cgroup v2 files do not, so use perf when
+# it is available.
+PERF_STAT_BINARY_CANDIDATES = [
+    os.environ.get("INFEREDGE_PERF_BIN"),
+    shutil.which("perf"),
+    "/usr/lib/linux-tools-5.15.0-25/perf",
+]
+PERF_STAT_BINARY_PATH = next((path for path in PERF_STAT_BINARY_CANDIDATES if path and os.path.exists(path)), None)
+PERF_STAT_EVENTS = [
+    "cpu-cycles",
+    "instructions",
+    "cache-misses",
+    "cache-references",
+    "bus-cycles",
+    "branch-instructions",
+    "branch-misses",
+]
 
 # A list of tuples containing the names of metrics from running time to measure, alongside the 
 # new name of the metric as it will be written in the results file
@@ -203,14 +238,12 @@ def collect_time_data(n, results_filename, container_exec_cmd, container_start_c
         experiments += ["docker"] * n
     if "wasm_interpreted" in deployment_mechanisms:
         experiments += ["wasm_interpreted"] * n
-    if "wasm_jit" in deployment_mechanisms:
-        experiments += ["wasm_jit"] * n
+    if "wasm_jit" in deployment_mechanisms and results_filename not in persistent_jit_time_rows_by_file:
+        experiments += ["wasm_jit"]
     if "wasm_aot" in deployment_mechanisms:
         experiments += ["wasm_aot"] * n
     if "native" in deployment_mechanisms:
         experiments += ["native"] * n
-    if "wasm_jit" in deployment_mechanisms and results_filename not in persistent_jit_time_rows_by_file:
-        experiments += ["wasm_jit"]
     random.shuffle(experiments)
 
     # Keep track of trial number for each deployment mechanism
@@ -497,6 +530,64 @@ def parse_time_output(output):
             metrics[metric_name] = value
 
     return metrics
+
+def build_perf_stat_command(cmd):
+    """Wrap a command in perf stat when a usable perf binary exists."""
+    if PERF_STAT_BINARY_PATH is None:
+        return None
+
+    return [
+        PERF_STAT_BINARY_PATH,
+        "stat",
+        "-x",
+        ",",
+        "-e",
+        ",".join(PERF_STAT_EVENTS),
+        "--",
+    ] + shlex.split(cmd)
+
+def parse_perf_stat_output(output):
+    """Parse perf stat CSV output into InferEdge perf metric names."""
+    metrics = {}
+    for line in output.splitlines():
+        parts = line.strip().split(",")
+        if len(parts) < 3:
+            continue
+
+        raw_value = parts[0].strip()
+        event_name = parts[2].strip()
+        if event_name not in PERF_EVENTS:
+            continue
+        if raw_value in ("<not supported>", "<not counted>", ""):
+            continue
+
+        try:
+            metrics[event_name] = float(raw_value.replace(",", ""))
+        except ValueError:
+            continue
+
+    return metrics
+
+def run_perf_stat_and_get_metrics(cmd):
+    """Run a command under perf stat and return hardware event counters plus stdout."""
+    perf_cmd = build_perf_stat_command(cmd)
+    if perf_cmd is None:
+        return {}, ""
+
+    stdout, stderr = run_shell_cmd_and_get_stdout_and_stderr(perf_cmd)
+    return parse_perf_stat_output(stderr), stdout
+
+def resolve_suite_data_path(base_dir, filename):
+    """Resolve files from either transferred layout or source checkout layout."""
+    direct_path = os.path.join(base_dir, filename)
+    if os.path.exists(direct_path):
+        return direct_path
+
+    nested_path = os.path.join(base_dir, os.path.basename(base_dir), filename)
+    if os.path.exists(nested_path):
+        return nested_path
+
+    return direct_path
 
 def collect_perf_data(n, results_filename, container_exec_cmd, container_start_cmd, wasm_interpreted_cmd, wasm_jit_cmd, wasm_aot_cmd, native_cmd,
     allow_missing_metrics, deployment_mechanisms):
@@ -807,7 +898,7 @@ def poll_cgroup_v2_memory_until_process_exits(process, cgroup_path):
         last_snapshot = read_cgroup_v2_snapshot(cgroup_path)
         memory_samples.append(last_snapshot["memory_current"])
 
-    return last_snapshot, memory_samples
+    return last_snapshot, memory_samples, stdout, stderr
 
 def cleanup_cgroup_v2_custom_cgroup():
     """Remove the custom cgroup v2 group if it is empty."""
@@ -825,7 +916,9 @@ def prepare_cgroup_v2_custom_cgroup():
 def run_command_in_cgroup_v2(cmd, cgroup_path):
     """Run a command inside a cgroup v2 group and collect resource metrics."""
     before = read_cgroup_v2_snapshot(cgroup_path)
-    quoted_cmd = " ".join(shlex.quote(part) for part in shlex.split(cmd))
+    perf_cmd = build_perf_stat_command(cmd)
+    command_parts = perf_cmd if perf_cmd is not None else shlex.split(cmd)
+    quoted_cmd = " ".join(shlex.quote(part) for part in command_parts)
     shell_cmd = (
         f"echo $$ > {shlex.quote(os.path.join(cgroup_path, 'cgroup.procs'))}; "
         f"export LD_LIBRARY_PATH={shlex.quote(LD_LIBRARY_PATH or '')}; "
@@ -835,10 +928,13 @@ def run_command_in_cgroup_v2(cmd, cgroup_path):
 
     start_timestamp = datetime.now(timezone.utc).timestamp()
     process = subprocess.Popen(["sudo", "sh", "-c", shell_cmd], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    after, memory_samples = poll_cgroup_v2_memory_until_process_exits(process, cgroup_path)
+    after, memory_samples, stdout, stderr = poll_cgroup_v2_memory_until_process_exits(process, cgroup_path)
     end_timestamp = datetime.now(timezone.utc).timestamp()
 
-    return build_cgroup_v2_metrics(before, after, memory_samples, end_timestamp - start_timestamp)
+    metrics = build_cgroup_v2_metrics(before, after, memory_samples, end_timestamp - start_timestamp)
+    if perf_cmd is not None:
+        metrics.update(parse_perf_stat_output(stderr))
+    return metrics
 
 def run_non_container_perf_experiment_cgroup_v2(cmd):
     """Run a native/Wasm perf experiment using cgroup v2 counters."""
@@ -853,7 +949,9 @@ def run_non_container_perf_experiment_cgroup_v2(cmd):
 def run_command_in_cgroup_v2_with_output(cmd, cgroup_path):
     """Run a command inside a cgroup v2 group and return metrics plus stdout."""
     before = read_cgroup_v2_snapshot(cgroup_path)
-    quoted_cmd = " ".join(shlex.quote(part) for part in shlex.split(cmd))
+    perf_cmd = build_perf_stat_command(cmd)
+    command_parts = perf_cmd if perf_cmd is not None else shlex.split(cmd)
+    quoted_cmd = " ".join(shlex.quote(part) for part in command_parts)
     shell_cmd = (
         f"echo $$ > {shlex.quote(os.path.join(cgroup_path, 'cgroup.procs'))}; "
         f"export LD_LIBRARY_PATH={shlex.quote(LD_LIBRARY_PATH or '')}; "
@@ -884,7 +982,10 @@ def run_command_in_cgroup_v2_with_output(cmd, cgroup_path):
         memory_samples.append(after["memory_current"])
 
     duration_seconds = end_timestamp - start_timestamp
-    return build_cgroup_v2_metrics(before, after, memory_samples, duration_seconds), stdout, duration_seconds
+    metrics = build_cgroup_v2_metrics(before, after, memory_samples, duration_seconds)
+    if perf_cmd is not None:
+        metrics.update(parse_perf_stat_output(stderr))
+    return metrics, stdout, duration_seconds
 
 def run_persistent_non_container_perf_experiment(cmd):
     """Run one persistent non-container process and return aggregate perf metrics plus stdout."""
@@ -1178,21 +1279,15 @@ def stop_container(container_name):
     run_shell_cmd(cmd)
 
 def remove_container(container_name):
-    """Removes a container with the given name.
-
-    Args:
-        container_name: The name of the container to remove
-    """
+    """Remove a Docker container if it exists."""
     cmd = CONTAINER_REMOVE_CMD.format(container_name=container_name).split()
-
-    try:
-        run_shell_cmd(cmd)
-    except subprocess.CalledProcessError as e:
-        # The following error happens if the container was not successfully
-        # started in the first place; this does not necessarily indicate a 
-        # major failure so we can ignore it
-        if "No such container" not in e.stderr:
-            raise
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=COMMAND_ENV)
+    if result.returncode != 0 and "No such container" not in result.stderr:
+        print(f"Error executing command: {' '.join(cmd)}")
+        print(f"Return code: {result.returncode}")
+        print(f"Output: {result.stdout}")
+        print(f"Error: {result.stderr}")
+        raise subprocess.CalledProcessError(result.returncode, cmd, output=result.stdout, stderr=result.stderr)
 
 def remove_container_and_its_prometheus_data(container_name):
     """Removes a container with the given name, and deletes its Prometheus data.
@@ -1227,7 +1322,7 @@ def run_shell_cmd_and_get_stdout_and_stderr(cmd):
         The output of the command
     """
     try:
-        result = subprocess.run(cmd, check=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        result = subprocess.run(cmd, check=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=COMMAND_ENV)
         return result.stdout, result.stderr
     except subprocess.CalledProcessError as e:
         print(f"Error executing command: {' '.join(cmd)}")
@@ -1246,7 +1341,7 @@ def run_shell_cmd_and_get_stdout(cmd):
         The output of the command
     """
     try:
-        result = subprocess.run(cmd, check=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        result = subprocess.run(cmd, check=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=COMMAND_ENV)
         return result.stdout
     except subprocess.CalledProcessError as e:
         print(f"Error executing command: {' '.join(cmd)}")
@@ -1265,7 +1360,7 @@ def run_shell_cmd_and_get_stderr(cmd):
     """
     # Use stdout=subprocess.DEVNULL to suppress the output to stdout
     try:
-        result = subprocess.run(cmd, check=True, text=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        result = subprocess.run(cmd, check=True, text=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=COMMAND_ENV)
         return result.stderr
     except subprocess.CalledProcessError as e:
         print(f"Error executing command: {' '.join(cmd)}")
@@ -1281,7 +1376,7 @@ def run_shell_cmd(cmd):
         cmd: The command to run
     """
     try:
-        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=COMMAND_ENV)
     except subprocess.CalledProcessError as e:
         print(f"Error executing command: {' '.join(cmd)}")
         print(f"Return code: {e.returncode}")
@@ -1298,7 +1393,7 @@ def run_shell_cmd_in_background(cmd):
     try:
         # Use stdout=subprocess.DEVNULL and stderr=subprocess.DEVNULL to suppress the output
         # to stdout and stderr
-        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=COMMAND_ENV)
     except subprocess.CalledProcessError as e:
         print(f"Error executing command: {' '.join(cmd)}")
         print(f"Return code: {e.returncode}")
@@ -1464,8 +1559,8 @@ def main():
     allow_missing_metrics = args.allow_missing_metrics
 
     # Path to the model and input
-    model_path = f"models/{model}"
-    input_path = f"inputs/{input_file}"
+    model_path = resolve_suite_data_path("models", model)
+    input_path = resolve_suite_data_path("inputs", input_file)
 
     # The name of the Docker image to use
     img_name = IMG_NAME_TEMPLATE.format(arch=arch)
@@ -1490,7 +1585,9 @@ def main():
 
     # The name of the file to store the results in
     results_filename_prefix = f"{model}&{input_file}"
-    results_filename_prefix_with_path = os.path.join(RESULTS_DIR, set_name, results_filename_prefix)
+    results_set_dir = os.path.join(RESULTS_DIR, set_name)
+    os.makedirs(results_set_dir, exist_ok=True)
+    results_filename_prefix_with_path = os.path.join(results_set_dir, results_filename_prefix)
 
     try:
         if not args.skip_perf:

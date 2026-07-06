@@ -1,6 +1,7 @@
-FROM golang:1.23.4-bullseye
+FROM --platform=$BUILDPLATFORM golang:1.23.4-bullseye
 
 ARG TARGETARCH
+ARG BUILDPLATFORM
 
 # Set environment variables
 ENV GOROOT=/usr/local/go

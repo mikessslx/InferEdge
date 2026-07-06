@@ -3,7 +3,7 @@ libtorch/bin
 libtorch/include
 libtorch/lib
 libtorch/share
-rust/native
+rust/native/target
 prometheus/prometheus
 cadvisor/cadvisor
 rust/wasm/target

@@ -1,5 +1,6 @@
 # Build stage: compile Rust app
 ARG BUILDPLATFORM=linux/amd64
+ARG TARGETPLATFORM
 FROM --platform=$BUILDPLATFORM rust:1.82-bullseye AS build
 
 ARG TARGETARCH
@@ -30,21 +31,28 @@ RUN apt-get update && \
 # Compile the Rust code to a native binary
 RUN case "$TARGETARCH" in \
     "amd64") \
-        export RUST_TARGET="x86_64-unknown-linux-gnu" ;; \
+        export RUST_TARGET="x86_64-unknown-linux-gnu" && \
+        export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=gcc ;; \
     "arm64") \
         dpkg --add-architecture arm64 && \
-        export RUST_TARGET="aarch64-unknown-linux-gnu" ;; \
+        export RUST_TARGET="aarch64-unknown-linux-gnu" && \
+        export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc && \
+        export CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++ && \
+        export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc ;; \
     "arm") \
         export RUST_TARGET="armv7-unknown-linux-gnueabihf" ;; \
     *) echo "Unsupported architecture: $TARGETARCH" && exit 1 ;; \
     esac && \
     export LIBTORCH=/libtorch && \
+    export LIBTORCH_INCLUDE=/libtorch/include && \
+    export LIBTORCH_LIB=/libtorch/lib && \
+    export LD_LIBRARY_PATH=/libtorch/lib:${LD_LIBRARY_PATH:-} && \
     rustup target add $RUST_TARGET && \
     cargo build --release --target $RUST_TARGET && \
     mv target/${RUST_TARGET}/release/${APP_NAME} /${APP_NAME}
 
 # Final stage: create runtime image
-FROM ubuntu:20.04
+FROM --platform=$TARGETPLATFORM ubuntu:20.04
 
 ARG TARGETARCH
 ARG TARGETVARIANT

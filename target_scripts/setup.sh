@@ -66,6 +66,12 @@ function enable_memory_controller() {
     # can be collected
     local cmdline_file="/boot/firmware/cmdline.txt"
     local cgroup_enable_param="cgroup_enable=memory"
+
+    if [ ! -f "$cmdline_file" ]; then
+        echo "Skipping cgroup memory boot parameter setup; $cmdline_file does not exist on this target."
+        return
+    fi
+
     local current_cmdline_contents="$(cat "$cmdline_file")"
 
     if ! grep -q "$cgroup_enable_param" <<< "$current_cmdline_contents"
@@ -101,7 +107,8 @@ function load_docker_image() {
 function setup_cadvisor() {
     # Grant execute permissions to the cAdvisor binary and install required packages
     chmod u+x "$SUITE_PATH/cadvisor/cadvisor"
-    apt install libpfm4 linux-perf
+    apt install -y libpfm4
+    apt install -y linux-perf || apt install -y linux-tools-common linux-tools-generic || true
 }
 
 function setup_prometheus() {
