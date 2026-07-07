@@ -967,6 +967,8 @@ function prompt_user_for_mechanisms() {
         echo "3. WebAssembly interpreted"
         echo "4. WebAssembly JIT-compiled"
         echo "5. WebAssembly ahead of time (AoT)-compiled"
+        echo "6. WebAssembly ahead of time (AoT)-compiled persistent"
+        echo "7. Native persistent"
     local mechanisms_input
     read -p "Enter the numbers identifying the deployment mechanisms you would like to include (comma-separated): " mechanisms_input
 
@@ -981,6 +983,8 @@ function prompt_user_for_mechanisms() {
             3) mechanisms+=("wasm_interpreted") ;;
             4) mechanisms+=("wasm_jit") ;;
             5) mechanisms+=("wasm_aot") ;;
+            6) mechanisms+=("wasm_aot_persistent") ;;
+            7) mechanisms+=("native_persistent") ;;
         esac
     done
 

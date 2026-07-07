@@ -386,7 +386,7 @@ def main():
     parser.add_argument("--docker-overhead-view", type=int, default=2, help="The view of the Docker overhead to use (0: exclude daemon overhead, 1: include full daemon overhead, 2: include only additional docker overhead).")
     parser.add_argument("--include-insignificant-output", action="store_true", help="Include statistical comparisons when they are not statistically significant.")
     parser.add_argument("--mechanisms", type=str, default="docker,wasm_interpreted,wasm_jit,wasm_aot,native",
-                    help="Comma-separated list of mechanisms to include (choose from docker, wasm_interpreted, wasm_jit, wasm_aot, native)")
+                    help="Comma-separated list of mechanisms to include (choose from docker, wasm_interpreted, wasm_jit, wasm_aot, wasm_aot_persistent, native, native_persistent)")
     parser.add_argument("--metrics", type=str, required=True, help="Comma-separated list of metrics to include.")
     parser.add_argument("--view-output", action="store_true", help="View the output of the analysis.")
     parser.add_argument("--save-output", action="store_true", 

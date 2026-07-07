@@ -83,6 +83,7 @@ Important environment variables:
 Examples:
   TARGET_PASSWORD='your-ssh-password' ./run_paper_vm_benchmark.sh
   TRIALS=5 TARGET_PASSWORD='your-ssh-password' ./run_paper_vm_benchmark.sh
+  MECHANISMS=wasm_jit,wasm_aot,wasm_aot_persistent,native,native_persistent ./run_paper_vm_benchmark.sh
   SET_NAME=paper_vm_selected_5models_3inputs_5trials_20260527 ./run_paper_vm_benchmark.sh status
 EOF
 }
@@ -359,7 +360,7 @@ if [[ ! -x "$HOME/.wasmedge/bin/wasmedge" ]]; then
   die "WasmEdge binary not found at $HOME/.wasmedge/bin/wasmedge"
 fi
 
-if [[ ",$MECHANISMS," == *",wasm_aot,"* ]]; then
+if [[ ",$MECHANISMS," == *",wasm_aot,"* || ",$MECHANISMS," == *",wasm_aot_persistent,"* ]]; then
   log "Compiling wasm/aot.wasm with WasmEdge O0 AOT."
   "$HOME/.wasmedge/bin/wasmedge" compile --optimize 0 wasm/interpreted.wasm wasm/aot.wasm
 fi

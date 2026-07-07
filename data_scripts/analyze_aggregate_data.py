@@ -39,24 +39,30 @@ AGGREGATE_CSV_FILENAME = "aggregate_results.csv"
 # Maps deployment mechanisms to colors and line styles for plotting
 DEPLOYMENT_MECHANISM_TO_COLOR = {
     "wasm_aot": "tab:red",
+    "wasm_aot_persistent": "tab:pink",
     "wasm_jit": "tab:purple",
     "wasm_interpreted": "tab:blue",
     "docker": "tab:green",
     "native": "tab:orange",
+    "native_persistent": "tab:brown",
 }
 DEPLOYMENT_MECHANISM_TO_LINESTYLE = {
     "wasm_aot": "-",
+    "wasm_aot_persistent": "--",
     "wasm_jit": "-",
     "wasm_interpreted": "--",
     "docker": "-.",
     "native": ":",
+    "native_persistent": "-.",
 }
 DEPLOYMENT_MECHANISM_TO_LABEL = {
     "wasm_aot": "AOT-compiled WebAssembly",
+    "wasm_aot_persistent": "AOT-compiled WebAssembly (persistent)",
     "wasm_jit": "JIT-compiled WebAssembly",
     "wasm_interpreted": "Interpreted WebAssembly",
     "docker": "Docker",
     "native": "Native",
+    "native_persistent": "Native (persistent)",
 }
 
 def format_input_label(filename):
