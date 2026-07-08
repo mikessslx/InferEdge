@@ -13,10 +13,18 @@ fn main() {
         panic!("Failed to load model {}: {:?}", runtime_args.model_path, e);
     });
     let load_model_elapsed = start.elapsed();
+    println!(
+        "Time until model loaded in seconds: {:.6}",
+        load_model_elapsed.as_secs_f64()
+    );
 
     let (input, input_loaded_seconds, input_resized_seconds) =
         image_to_tensor(&runtime_args.image_path, 224, 224, start);
     let load_input_elapsed = start.elapsed();
+    println!(
+        "Time until input ready in seconds: {:.6}",
+        load_input_elapsed.as_secs_f64()
+    );
 
     for trial in 1..=runtime_args.trials {
         let trial_start = Instant::now();
@@ -27,7 +35,6 @@ fn main() {
             });
         let inference_duration = trial_start.elapsed();
         let inference_elapsed = start.elapsed();
-        let trial_workload_duration = trial_start.elapsed();
         let total_elapsed = start.elapsed();
 
         println!("InferEdge trial {} start", trial);
@@ -47,7 +54,7 @@ fn main() {
                 0.0,
                 0.0,
                 inference_duration.as_secs_f64(),
-                trial_workload_duration.as_secs_f64(),
+                inference_duration.as_secs_f64(),
             );
         }
 
@@ -75,19 +82,25 @@ fn parse_runtime_args() -> RuntimeArgs {
         match args[i].as_str() {
             "--trials" => {
                 if i + 1 >= args.len() {
-                    panic!("Missing value after --trials");
+                    eprintln!("Missing value after --trials");
+                    std::process::exit(2);
                 }
-                trials = args[i + 1]
-                    .parse::<usize>()
-                    .unwrap_or_else(|_| panic!("Invalid --trials value: {}", args[i + 1]));
+                trials = args[i + 1].parse::<usize>().unwrap_or_else(|_| {
+                    eprintln!("Invalid --trials value: {}", args[i + 1]);
+                    std::process::exit(2);
+                });
                 i += 2;
             }
-            option => panic!("Unknown option: {}", option),
+            option => {
+                eprintln!("Unknown option: {}", option);
+                std::process::exit(2);
+            }
         }
     }
 
     if trials == 0 {
-        panic!("--trials must be at least 1");
+        eprintln!("--trials must be at least 1");
+        std::process::exit(2);
     }
 
     RuntimeArgs {
@@ -138,10 +151,20 @@ fn image_to_tensor(path: &str, height: u32, width: u32, start: Instant) -> (Tens
     let img = image::load_from_memory(&img_buf).unwrap().to_rgb8();
 
     let load_image_elapsed = start.elapsed();
+    let input_loaded_seconds = load_image_elapsed.as_secs_f64();
+    println!(
+        "Time until input loaded in seconds: {:.6}",
+        input_loaded_seconds
+    );
 
     let resized =
         image::imageops::resize(&img, height, width, image::imageops::FilterType::Triangle);
     let resize_elapsed = start.elapsed();
+    let input_resized_seconds = resize_elapsed.as_secs_f64();
+    println!(
+        "Time until input resized in seconds: {:.6}",
+        input_resized_seconds
+    );
 
     let mut flat_img = Vec::with_capacity((height * width * 3) as usize);
     for rgb in resized.pixels() {
@@ -155,11 +178,7 @@ fn image_to_tensor(path: &str, height: u32, width: u32, start: Instant) -> (Tens
         .permute(&[2, 0, 1])
         .unsqueeze(0);
 
-    (
-        tensor,
-        load_image_elapsed.as_secs_f64(),
-        resize_elapsed.as_secs_f64(),
-    )
+    (tensor, input_loaded_seconds, input_resized_seconds)
 }
 
 fn print_top5(output: &Tensor) {

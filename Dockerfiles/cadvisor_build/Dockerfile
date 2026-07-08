@@ -10,7 +10,7 @@ ENV PATH=$PATH:$GOROOT/bin:$GOPATH/bin
 ENV GOOS=linux
 ENV CGO_ENABLED=1
 ENV CGO_CFLAGS="-I/usr/include/perfmon"
-ENV GOPROXY="https://goproxy.cn,https://proxy.golang.org,direct"
+ENV GOPROXY="https://proxy.golang.org|https://goproxy.cn|direct"
 ENV GOSUMDB=off
 
 # Install dependency packages based on the architecture

@@ -53,16 +53,16 @@ DEPLOYMENT_MECHANISM_TO_LINESTYLE = {
     "wasm_interpreted": "--",
     "docker": "-.",
     "native": ":",
-    "native_persistent": "-.",
+    "native_persistent": "--",
 }
 DEPLOYMENT_MECHANISM_TO_LABEL = {
     "wasm_aot": "AOT-compiled WebAssembly",
-    "wasm_aot_persistent": "AOT-compiled WebAssembly (persistent)",
+    "wasm_aot_persistent": "AOT-compiled WebAssembly persistent",
     "wasm_jit": "JIT-compiled WebAssembly",
     "wasm_interpreted": "Interpreted WebAssembly",
     "docker": "Docker",
     "native": "Native",
-    "native_persistent": "Native (persistent)",
+    "native_persistent": "Native persistent",
 }
 
 def format_input_label(filename):

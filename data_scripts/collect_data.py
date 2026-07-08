@@ -66,7 +66,11 @@ CONTAINER_REMOVE_CMD = "sudo docker rm -f {container_name}"
 CONTAINER_INSPECT_ID_CMD = "sudo docker inspect -f '{{{{.Id}}}}' {container_name}"
 
 # Commands to start and stop Prometheus, cAdvisor
-PROMETHEUS_START_CMD = f"sudo {PROMETHEUS_BINARY_PATH} --config.file={SUITE_DIR}/prometheus/prometheus.yml --web.enable-admin-api" 
+PROMETHEUS_START_CMD = (
+    f"sudo {PROMETHEUS_BINARY_PATH} --config.file={SUITE_DIR}/prometheus/prometheus.yml "
+    "--web.enable-admin-api --enable-feature=promql-at-modifier "
+    "--storage.tsdb.path=/tmp/inferedge-prometheus-data"
+)
 PROMETHEUS_STOP_CMD = f"sudo pkill -f {PROMETHEUS_BINARY_PATH}"
 CADVISOR_START_CMD = f"sudo {CADVISOR_BINARY_PATH} -perf_events_config={CADVISOR_PERF_CONFIG_PATH}"
 CADVISOR_STOP_CMD = f"sudo pkill -f {CADVISOR_BINARY_PATH}"
@@ -154,6 +158,14 @@ DAEMON_MEASUREMENT_TIME = 10
 
 # How long we wait after cAdvisor & Prometheus are started before starting an experiment
 CADVISOR_PROMETHEUS_WAIT_TIME = 20
+
+# Extra padding around short non-container perf runs. cAdvisor/Prometheus sample
+# asynchronously, so very short trials can finish between scrapes and produce
+# empty perf counters. Padding keeps the cgroup visible long enough to scrape.
+NON_CONTAINER_PERF_PRE_SAMPLE_WAIT_SECONDS = 2.0
+NON_CONTAINER_PERF_POST_SAMPLE_WAIT_SECONDS = 2.0
+NON_CONTAINER_MIN_PROMETHEUS_QUERY_WINDOW_MS = 3000
+
 CGROUP_V2_DOCKER_SERVICE_PATH = "/sys/fs/cgroup/system.slice/docker.service"
 CGROUP_V2_CUSTOM_PATH = f"/sys/fs/cgroup/{CUSTOM_CGROUP_NAME}"
 CGROUP_V2_POLL_INTERVAL_SECONDS = 0.02
@@ -205,9 +217,21 @@ MAX_RETRIES = 15
 # Variable tracking whether cAdvisor and Prometheus are currently running or not
 cadvisor_and_prometheus_running = False
 
-# When perf collection is enabled, persistent runs can also provide the timing
+# When perf collection is enabled, persistent runs can also provide timing
 # rows. Cache them so the time collection step does not start them again.
-persistent_time_rows_by_file = {}
+persistent_jit_time_rows_by_file = {}
+
+PERSISTENT_MECHANISM_LABELS = {
+    "wasm_jit": "JIT",
+    "wasm_aot_persistent": "AOT persistent",
+    "native_persistent": "native persistent",
+}
+
+def is_persistent_mechanism(mechanism):
+    return mechanism in PERSISTENT_MECHANISM_LABELS
+
+def persistent_mechanism_label(mechanism):
+    return PERSISTENT_MECHANISM_LABELS.get(mechanism, mechanism)
 
 def is_cgroup_v2():
     """Checks if the system is using cgroup v2
@@ -217,8 +241,8 @@ def is_cgroup_v2():
     """
     return os.path.isfile("/sys/fs/cgroup/cgroup.controllers")
 
-def collect_time_data(n, results_filename, container_exec_cmd, container_start_cmd, wasm_interpreted_cmd, wasm_jit_cmd, 
-    wasm_aot_cmd, wasm_aot_persistent_cmd, native_cmd, native_persistent_cmd, deployment_mechanisms):
+def collect_time_data(n, results_filename, container_exec_cmd, container_start_cmd, wasm_interpreted_cmd, wasm_jit_cmd, wasm_aot_cmd, native_cmd,
+    wasm_aot_persistent_cmd, native_persistent_cmd, deployment_mechanisms):
     """Runs the time experiments and collects the relevant data from the output, storing it in the specified file.
 
     Args:
@@ -229,15 +253,15 @@ def collect_time_data(n, results_filename, container_exec_cmd, container_start_c
         wasm_interpreted_cmd: The command to run the workload for the WebAssembly interpreted mechanism
         wasm_jit_cmd: The command to run the workload for the WebAssembly JIT-compiled mechanism
         wasm_aot_cmd: The command to run the workload for the WebAssembly AOT mechanism
-        wasm_aot_persistent_cmd: The command to run repeated WebAssembly AOT trials in one process
         native_cmd: The command to run the workload as a standalone native binary, for the native mechanism
-        native_persistent_cmd: The command to run repeated native trials in one process
+        wasm_aot_persistent_cmd: The command to run AOT trials in one persistent WasmEdge process
+        native_persistent_cmd: The command to run native trials in one persistent native process
         deployment_mechanisms: The list of deployment mechanisms to use
     """
     persistent_commands = {
-        "wasm_jit": ("JIT", wasm_jit_cmd),
-        "wasm_aot_persistent": ("AOT persistent", wasm_aot_persistent_cmd),
-        "native_persistent": ("native persistent", native_persistent_cmd),
+        "wasm_jit": wasm_jit_cmd,
+        "wasm_aot_persistent": wasm_aot_persistent_cmd,
+        "native_persistent": native_persistent_cmd,
     }
 
     # Randomly intersperse experiments of each type
@@ -246,25 +270,24 @@ def collect_time_data(n, results_filename, container_exec_cmd, container_start_c
         experiments += ["docker"] * n
     if "wasm_interpreted" in deployment_mechanisms:
         experiments += ["wasm_interpreted"] * n
-    for mechanism in persistent_commands:
-        if mechanism in deployment_mechanisms and results_filename not in persistent_time_rows_by_file:
-            experiments += [mechanism]
     if "wasm_aot" in deployment_mechanisms:
         experiments += ["wasm_aot"] * n
     if "native" in deployment_mechanisms:
         experiments += ["native"] * n
+    for mechanism in persistent_commands:
+        if mechanism in deployment_mechanisms and results_filename not in persistent_jit_time_rows_by_file:
+            experiments += [mechanism]
     random.shuffle(experiments)
 
     # Keep track of trial number for each deployment mechanism
     docker_trial = 1
     wasm_interpreted_trial = 1
-    wasm_jit_trial = 1
     wasm_aot_trial = 1
     native_trial = 1
 
     metrics = []
-    if results_filename in persistent_time_rows_by_file:
-        metrics.extend(persistent_time_rows_by_file.pop(results_filename))
+    if any(is_persistent_mechanism(mechanism) for mechanism in deployment_mechanisms) and results_filename in persistent_jit_time_rows_by_file:
+        metrics.extend(persistent_jit_time_rows_by_file.pop(results_filename))
 
     # Noting that experiments contains deployment mechanisms in the order they will be run
     for deployment_mechanism in experiments:
@@ -302,12 +325,12 @@ def collect_time_data(n, results_filename, container_exec_cmd, container_start_c
                     print(f"Error during wasm_interpreted trial {trial}, attempt {attempt + 1}: {e}")
                     if attempt == MAX_RETRIES - 1:
                         break
-        elif deployment_mechanism in persistent_commands:
-            persistent_label, persistent_cmd = persistent_commands[deployment_mechanism]
-            print(f"Running {n} {persistent_label} trials in one persistent process")
+        elif is_persistent_mechanism(deployment_mechanism):
+            label = persistent_mechanism_label(deployment_mechanism)
+            print(f"Running {n} {label} trials in one persistent process")
             for attempt in range(MAX_RETRIES):
                 try:
-                    persistent_trial_metrics = run_persistent_time_experiment(persistent_cmd, n)
+                    persistent_trial_metrics = run_persistent_time_experiment(persistent_commands[deployment_mechanism], n)
                     metrics.extend(prepare_persistent_time_rows(deployment_mechanism, start_time, persistent_trial_metrics))
                     break
                 except Exception as e:
@@ -425,7 +448,7 @@ def run_time_experiment(cmd):
     return [("", time_metrics)]
 
 def run_persistent_time_experiment(cmd, trials):
-    """Run one persistent process and split its output into per-trial timing rows."""
+    """Run one persistent JIT process and split its output into per-trial timing rows."""
     stop_cadvisor_and_prometheus_if_running()
     cmd = TIME_CMD_PREFIX.split() + cmd.split()
     cmd_output, time_output = run_shell_cmd_and_get_stdout_and_stderr(cmd)
@@ -449,12 +472,12 @@ def build_persistent_time_metrics(output, process_wall_seconds, expected_trials)
     """Build per-trial timing metrics from one persistent workload process.
 
     Trial 1 receives the process-level cold-start overhead. Later trials keep only
-    the in-process repeated inference/request time, because the process is already
-    alive.
+    the in-process repeated inference/request time, because the WasmEdge/JIT
+    process is already alive.
     """
     trial_metrics = parse_persistent_time_output(output)
     if len(trial_metrics) != expected_trials:
-        raise ValueError(f"Expected {expected_trials} persistent JIT trials, found {len(trial_metrics)}")
+        raise ValueError(f"Expected {expected_trials} persistent trials, found {len(trial_metrics)}")
 
     warm_workload_seconds = sum(metrics["workload-time-seconds"] for metrics in trial_metrics[1:])
     for index, metrics in enumerate(trial_metrics):
@@ -599,8 +622,8 @@ def resolve_suite_data_path(base_dir, filename):
 
     return direct_path
 
-def collect_perf_data(n, results_filename, container_exec_cmd, container_start_cmd, wasm_interpreted_cmd, wasm_jit_cmd, 
-    wasm_aot_cmd, wasm_aot_persistent_cmd, native_cmd, native_persistent_cmd, allow_missing_metrics, deployment_mechanisms):
+def collect_perf_data(n, results_filename, container_exec_cmd, container_start_cmd, wasm_interpreted_cmd, wasm_jit_cmd, wasm_aot_cmd, native_cmd,
+    wasm_aot_persistent_cmd, native_persistent_cmd, allow_missing_metrics, deployment_mechanisms):
     """Runs the performance experiments (measuring performance metrics besides time) and collects the relevant data from Prometheus, 
     storing it in the specified file.
 
@@ -612,16 +635,17 @@ def collect_perf_data(n, results_filename, container_exec_cmd, container_start_c
         wasm_interpreted_cmd: The command to run the workload for the WebAssembly interpreted mechanism
         wasm_jit_cmd: The command to run the workload for the WebAssembly JIT-compiled mechanism
         wasm_aot_cmd: The command to run the workload for the WebAssembly AOT mechanism
-        wasm_aot_persistent_cmd: The command to run repeated WebAssembly AOT trials in one process
         native_cmd: The command to run the workload as a standalone native binary, for the native mechanism
-        native_persistent_cmd: The command to run repeated native trials in one process
+        wasm_aot_persistent_cmd: The command to run AOT trials in one persistent WasmEdge process
+        native_persistent_cmd: The command to run native trials in one persistent native process
         allow_missing_metrics: Whether to allow missing metrics or not
         deployment_mechanisms: The list of deployment mechanisms to use
     """
+
     persistent_commands = {
-        "wasm_jit": ("JIT", wasm_jit_cmd),
-        "wasm_aot_persistent": ("AOT persistent", wasm_aot_persistent_cmd),
-        "native_persistent": ("native persistent", native_persistent_cmd),
+        "wasm_jit": wasm_jit_cmd,
+        "wasm_aot_persistent": wasm_aot_persistent_cmd,
+        "native_persistent": native_persistent_cmd,
     }
 
     # Randomly intersperse experiments of each type
@@ -630,19 +654,18 @@ def collect_perf_data(n, results_filename, container_exec_cmd, container_start_c
         experiments += ["docker"] * n
     if "wasm_interpreted" in deployment_mechanisms:
         experiments += ["wasm_interpreted"] * n
-    for mechanism in persistent_commands:
-        if mechanism in deployment_mechanisms:
-            experiments += [mechanism]
     if "wasm_aot" in deployment_mechanisms:
         experiments += ["wasm_aot"] * n
     if "native" in deployment_mechanisms:
         experiments += ["native"] * n
+    for mechanism in persistent_commands:
+        if mechanism in deployment_mechanisms:
+            experiments += [mechanism]
     random.shuffle(experiments)
 
     # Keep track of trial number for each deployment mechanism
     docker_trial = 1
     wasm_interpreted_trial = 1
-    wasm_jit_trial = 1
     wasm_aot_trial = 1
     native_trial = 1
 
@@ -690,23 +713,25 @@ def collect_perf_data(n, results_filename, container_exec_cmd, container_start_c
                         delete_prometheus_series_given_id(CUSTOM_CGROUP_NAME)
                     if attempt == MAX_RETRIES - 1:
                         raise
-        elif experiment in persistent_commands:
-            persistent_label, persistent_cmd = persistent_commands[experiment]
-            print(f"Running {n} {persistent_label} trials in one persistent process")
+        elif is_persistent_mechanism(experiment):
+            label = persistent_mechanism_label(experiment)
+            print(f"Running {n} {label} trials in one persistent process")
             for attempt in range(MAX_RETRIES):
                 try:
-                    trial_metrics, cmd_output, process_wall_seconds = run_persistent_non_container_perf_experiment(persistent_cmd)
+                    trial_metrics, cmd_output, process_wall_seconds = run_persistent_non_container_perf_experiment(persistent_commands[experiment])
                     normalized_trial_metrics = normalize_persistent_perf_metrics(trial_metrics, n)
                     for trial in range(1, n + 1):
                         trial_metrics_row = prepare_trial_data_as_csv_rows(experiment, trial, start_time, normalized_trial_metrics,
                             PERF_EVENTS + MEMORY_FIELD_NAMES + CPU_FIELD_NAMES, allow_missing_metrics)
                         metrics.extend(trial_metrics_row)
                     time_results_filename = results_filename.replace(PERF_RESULTS_FILENAME_SUFFIX, TIME_RESULTS_FILENAME_SUFFIX)
-                    persistent_time_rows_by_file.setdefault(time_results_filename, []).extend(prepare_persistent_time_rows(
-                        experiment,
-                        start_time,
-                        build_persistent_time_metrics(cmd_output, process_wall_seconds, n)
-                    ))
+                    persistent_jit_time_rows_by_file.setdefault(time_results_filename, []).extend(
+                        prepare_persistent_time_rows(
+                            experiment,
+                            start_time,
+                            build_persistent_time_metrics(cmd_output, process_wall_seconds, n)
+                        )
+                    )
                     break
                 except Exception as e:
                     print(f"Error during persistent {experiment} run, attempt {attempt + 1}: {e}")
@@ -1179,25 +1204,37 @@ def run_non_container_perf_experiment(cmd):
 
     start_cadvisor_and_prometheus_if_not_running()
 
+    # Ensure stale state from a previous attempt cannot make cgcreate fail.
+    cleanup_custom_cgroup()
+
     # Create the cgroup that the process will be assigned to
     run_shell_cmd(CREATE_CGROUP_CMD.split())
 
-    start_time = datetime.now(timezone.utc)
-    start_timestamp = start_time.timestamp()
+    measurement_start_time = datetime.now(timezone.utc)
+    measurement_start_timestamp = measurement_start_time.timestamp()
+
+    # Let cAdvisor observe the newly-created cgroup before the short workload runs.
+    time.sleep(NON_CONTAINER_PERF_PRE_SAMPLE_WAIT_SECONDS)
 
     run_in_cgroup_cmd = EXEC_IN_CGROUP_CMD_PREFIX.split() + cmd.split()
     run_shell_cmd(run_in_cgroup_cmd)
 
-    end_time = datetime.now(timezone.utc)
-    end_timestamp = end_time.timestamp()
+    # Keep the cgroup alive for at least one more scrape after the workload exits.
+    time.sleep(NON_CONTAINER_PERF_POST_SAMPLE_WAIT_SECONDS)
 
-    execution_duration_ms = round((end_timestamp - start_timestamp) * 1000)
+    query_end_time = datetime.now(timezone.utc)
+    query_end_timestamp = query_end_time.timestamp()
+
+    query_duration_ms = max(
+        round((query_end_timestamp - measurement_start_timestamp) * 1000),
+        NON_CONTAINER_MIN_PROMETHEUS_QUERY_WINDOW_MS,
+    )
 
     metrics = {}
 
     for query, label in zip(PROMETHEUS_PERF_AND_MEMORY_QUERIES, PROMETHEUS_QUERIES_LABELS):
-        formatted_query = query.format(name_or_id=f"/{CUSTOM_CGROUP_NAME}", 
-            container_duration_ms=execution_duration_ms, end_container_timestamp=end_timestamp)
+        formatted_query = query.format(name_or_id=f"/{CUSTOM_CGROUP_NAME}",
+            container_duration_ms=query_duration_ms, end_container_timestamp=query_end_timestamp)
         metrics.update(get_parsed_prometheus_query_results(formatted_query, label))
 
     delete_prometheus_series_given_id(CUSTOM_CGROUP_NAME)
@@ -1438,11 +1475,18 @@ def query_prometheus_with_params(params):
     Returns:
         The result of the query
     """
-    response = requests.get(f"{PROMETHEUS_URL}/api/v1/query", 
-        params)
-    data = response.json()
-    if data["status"] != "success":
-        raise Exception("Error: Prometheus query failed")
+    try:
+        response = requests.get(f"{PROMETHEUS_URL}/api/v1/query", params=params, timeout=5)
+    except requests.exceptions.RequestException as e:
+        raise Exception(f"Error: Prometheus query failed: {e}; params={params}")
+
+    try:
+        data = response.json()
+    except ValueError:
+        raise Exception(f"Error: Prometheus query failed: HTTP {response.status_code}; body={response.text}; params={params}")
+
+    if data.get("status") != "success":
+        raise Exception(f"Error: Prometheus query failed: HTTP {response.status_code}; body={data}; params={params}")
     return data["data"]["result"]
 
 def delete_prometheus_series_given_name(name):
@@ -1451,8 +1495,40 @@ def delete_prometheus_series_given_name(name):
     Args:
         name: The name of the series to delete
     """
-    match = f"{{name='{name}'}}"
+    match = f'{{__name__=~".+",name="{name}"}}'
     delete_prometheus_series(match)
+
+def delete_custom_cgroup_if_present():
+    """Deletes the custom cgroup if it exists, ignoring already-removed groups."""
+    result = subprocess.run(
+        DELETE_CGROUP_CMD.split(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=COMMAND_ENV,
+    )
+
+    if result.returncode == 0:
+        return
+
+    missing_messages = (
+        "No such file or directory",
+        "does not exist",
+        "Cgroup, requested group parameter does not exist",
+    )
+    if result.returncode == 96 or any(message in result.stderr for message in missing_messages):
+        return
+
+    print(f"Error executing command: {DELETE_CGROUP_CMD}")
+    print(f"Return code: {result.returncode}")
+    print(f"Output: {result.stdout}")
+    print(f"Error: {result.stderr}")
+    raise subprocess.CalledProcessError(
+        result.returncode,
+        DELETE_CGROUP_CMD.split(),
+        output=result.stdout,
+        stderr=result.stderr,
+    )
 
 def cleanup_custom_cgroup():
     """Cleans up the custom cgroup created for non-Docker experiments."""
@@ -1461,12 +1537,7 @@ def cleanup_custom_cgroup():
             cleanup_cgroup_v2_custom_cgroup()
         return
 
-    if cgroup_exists(CUSTOM_CGROUP_NAME):
-        try:
-            run_shell_cmd(DELETE_CGROUP_CMD.split())
-        except subprocess.CalledProcessError as e:
-            if e.returncode != 96 or "No such file or directory" not in e.stderr:
-                raise
+    delete_custom_cgroup_if_present()
     delete_prometheus_series_given_id(CUSTOM_CGROUP_NAME)
 
 def cgroup_exists(cgroup_name):
@@ -1495,7 +1566,8 @@ def delete_prometheus_series_given_id(id):
     Args:
         id: The ID of the series to delete
     """
-    match = f"{{id='{id}'}}"
+    prometheus_id = id if id.startswith("/") else f"/{id}"
+    match = f'{{__name__=~".+",id="{prometheus_id}"}}'
     delete_prometheus_series(match)
 
 def delete_prometheus_series(match):
@@ -1512,8 +1584,8 @@ def delete_prometheus_series(match):
     except requests.exceptions.RequestException as e:
         print(f"Warning: Prometheus series deletion skipped: {e}")
         return
-    if response.status_code != 204:
-        raise Exception("Error: Prometheus series deletion failed")
+    if response.status_code not in (200, 204):
+        raise Exception(f"Error: Prometheus series deletion failed: {response.status_code} {response.text}")
 
 def get_parsed_prometheus_query_results(query, label=None):
     """Queries Prometheus with a given query string and parses the output.
@@ -1560,8 +1632,8 @@ def main():
     parser.add_argument("--model", type=str, required=True, help="The ML model to use")
     parser.add_argument("--input", type=str, required=True, help="The input file to run ML inference on")
     parser.add_argument("--trials", type=int, required=True, help="The number of trials to run for each experiment type")
-    parser.add_argument("--mechanisms", type=str, default="docker,wasm_interpreted,wasm_jit,wasm_aot,native",
-                        help="Comma-separated list of mechanisms to include (choose from docker, wasm_interpreted, wasm_jit, wasm_aot, wasm_aot_persistent, native, native_persistent)")
+    parser.add_argument("--mechanisms", type=str, default="docker,wasm_interpreted,wasm_jit,wasm_aot,native,wasm_aot_persistent,native_persistent",
+                        help="Comma-separated list of mechanisms to include (choose from docker, wasm_interpreted, wasm_jit, wasm_aot, native, wasm_aot_persistent, native_persistent)")
     parser.add_argument("--arch", type=str, required=True, help="The architecture of the target device this is being run on")
     parser.add_argument("--set_name", type=str, required=True, help="The name of the set of experiments being run")
     parser.add_argument("--allow_missing_metrics", action="store_true", help="Allow missing events in the results")
@@ -1612,12 +1684,10 @@ def main():
 
     try:
         if not args.skip_perf:
-            collect_perf_data(trials, results_filename_prefix_with_path + PERF_RESULTS_FILENAME_SUFFIX, container_exec_cmd,
-                container_start_cmd, wasm_interpreted_cmd, wasm_jit_cmd, wasm_aot_cmd, wasm_aot_persistent_cmd, native_cmd,
-                native_persistent_cmd, allow_missing_metrics, mechanisms)
-        collect_time_data(trials, results_filename_prefix_with_path + TIME_RESULTS_FILENAME_SUFFIX, container_exec_cmd,
-            container_start_cmd, wasm_interpreted_cmd, wasm_jit_cmd, wasm_aot_cmd, wasm_aot_persistent_cmd, native_cmd,
-            native_persistent_cmd, mechanisms)
+            collect_perf_data(trials, results_filename_prefix_with_path + PERF_RESULTS_FILENAME_SUFFIX, container_exec_cmd, container_start_cmd,
+                wasm_interpreted_cmd, wasm_jit_cmd, wasm_aot_cmd, native_cmd, wasm_aot_persistent_cmd, native_persistent_cmd, allow_missing_metrics, mechanisms)
+        collect_time_data(trials, results_filename_prefix_with_path + TIME_RESULTS_FILENAME_SUFFIX, container_exec_cmd, container_start_cmd,
+            wasm_interpreted_cmd, wasm_jit_cmd, wasm_aot_cmd, native_cmd, wasm_aot_persistent_cmd, native_persistent_cmd, mechanisms)
     finally:
         if not args.skip_perf:
             cleanup_custom_cgroup()
